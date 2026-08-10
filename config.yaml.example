@@ -1,8 +1,21 @@
 server:
   port: 8080
+
 log_level: info
+
 readeck:
-  host: "https://your-readeck-instance.com"
+  host: "https://readeck.example.com"
+
+kobo:
+  store_api_host: "storeapi.kobo.com"
+  # Optional. Unknown Kobo API requests are transparently forwarded here.
+  # This preserves book sync when api_endpoint points to readeckobo instead.
+  # fallback_url: "http://calibre-web:8083"
+
 users:
-  - token: "a-very-secret-token-for-your-kobo"
-    readeck_access_token: "your-plain-text-readeck-access-token"
+  - token: "a-random-uuid-token-for-the-first-kobo"
+    readeck_access_token: "a-readeck-api-token-for-the-first-account"
+  - token: "a-random-uuid-token-for-the-second-kobo"
+    readeck_access_token: "a-readeck-api-token-for-the-second-account"
+    # Optional override when this account is on another Readeck instance.
+    readeck_host: "https://another-readeck.example.com"

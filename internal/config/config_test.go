@@ -162,3 +162,35 @@ func TestLoad(t *testing.T) {
 		})
 	}
 }
+
+func TestDefaultStoreAPIHost(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "config-test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer func() {
+		if err := os.RemoveAll(tmpDir); err != nil {
+			t.Errorf("Failed to remove temp dir: %v", err)
+		}
+	}()
+
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	yamlContent := `readeck:
+  host: "https://readeck.example.com"
+users:
+  - token: "test-token"
+    readeck_access_token: "test-readeck-token"
+`
+	if err := os.WriteFile(configPath, []byte(yamlContent), 0644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.Kobo.StoreAPIHost != "storeapi.kobo.com" {
+		t.Errorf("expected default store_api_host to be storeapi.kobo.com, got %s", cfg.Kobo.StoreAPIHost)
+	}
+}

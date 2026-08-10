@@ -1,5 +1,9 @@
 # readeckobo
 
+> This fork adds Calibre-Web integration and support for multiple Kobo devices
+> and Readeck accounts. Each device can sync books from a self-hosted Calibre
+> library alongside articles from its associated Readeck account.
+
 This tool acts as an Instapaper proxy, so your Kobo can sync with your
 [Readeck](https://readeck.com) articles.
 
@@ -31,9 +35,17 @@ server:
 log_level: info
 readeck:
   host: "https://your-readeck-instance.com"
+kobo:
+  store_api_host: "storeapi.kobo.com"
+  # Optional: keep Kobo book sync through Calibre-Web or another server.
+  fallback_url: "http://calibre-web:8083"
 users:
-  - token: "a-random-uuid-token-for-a-kobo"
-    readeck_access_token: "a-readeck-api-token"
+  - token: "a-random-uuid-token-for-the-first-kobo"
+    readeck_access_token: "a-readeck-api-token-for-the-first-account"
+  - token: "a-random-uuid-token-for-the-second-kobo"
+    readeck_access_token: "a-readeck-api-token-for-the-second-account"
+    # Optional, when this account uses another Readeck instance.
+    readeck_host: "https://another-readeck-instance.com"
 ```
 
 ### 2. Run with Docker
@@ -47,7 +59,7 @@ docker-compose up -d
 
 The server will be available at `http://localhost:8080`.
 
-### 3. Generate a Device Token
+### 3. Generate a Token for Each Device
 
 For each Kobo device, you will need a unique token. This process involves
 generating a token and then encrypting it for the Kobo device.
@@ -69,12 +81,17 @@ The script will output two important pieces of information:
 
 ### 4. Configure Your `readeckobo` and Kobo Device
 
-Follow the output from the script to configure your services.
+Run the script once per Kobo. Add each plain-text token and its corresponding Readeck
+API token as a separate `users` entry. Follow the output from the script to configure
+each device.
 
 1. **Update `config.yaml`**: Add the plain text UUID token to the `users`
     section of your `config.yaml`.
 
     ```yaml
+    kobo:
+      store_api_host: "storeapi.kobo.com"
+      # fallback_url: "http://calibre-web:8083"
     users:
       - token: "<THE-PLAIN-TEXT-UUID-FROM-THE-SCRIPT>"
         readeck_access_token: "a-readeck-api-token"
@@ -96,31 +113,17 @@ Follow the output from the script to configure your services.
 Replace `https://readeckobo.example.com` with the full path to where you are deploying
 the readeckobo service to
 
-### 5. Set Up a Reverse Proxy
-
-`readeckobo` must be run behind a reverse proxy to handle HTTPS. It's crucial
-to proxy three specific location blocks, as shown in our `nginx.conf.snippet`
-example.
-
-Your Kobo device periodically re-syncs its configuration from Kobo's servers,
-which can overwrite your custom Instapaper endpoint. The proxy rules below
-ensure this connection is preserved.
-
-<!-- markdownlint-disable MD013 -->
-| Location Block                                  | Proxies To               | Purpose                                                                                             |
-| ----------------------------------------------- | ------------------------ | --------------------------------------------------------------------------------------------------- |
-| `/instapaper-proxy/instapaper/`                 | `readeckobo` application | Handles the main Instapaper API requests (sync, download, etc.) to your `readeckobo` instance.      |
-| `/instapaper-proxy/storeapi/`                   | `storeapi.kobo.com`      | Forwards general API requests to Kobo's servers.                                                    |
-| `/instapaper-proxy/storeapi/v1/initialization`  | `storeapi.kobo.com`      | Intercepts the Kobo configuration response to rewrite the Instapaper URL back to your proxy endpoint. |
-<!-- markdownlint-enable MD013 -->
-
-Without these rules, your Kobo will eventually lose its connection to `readeckobo`.
+To keep syncing books from Calibre-Web, set `kobo.fallback_url` and append the path
+from each device's Calibre-Web Kobo URL to the readeckobo URL. For example, configure
+`api_endpoint=https://readeckobo.example.com/kobo/CALIBRE_TOKEN`. Requests on that path
+are forwarded unchanged, while Readeck article requests are handled by readeckobo.
+See [the configuration reference](docs/CONFIG.md#combining-article-and-book-sync).
 
 ## 🔒 A Quick Word on Security
 
 A little security goes a long way.
 
-* **Use HTTPS:** deploy behind a reverse proxy that provides HTTPS
+* **Use HTTPS:** use a reverse proxy (e.g., Caddy, nginx, traefik) to terminate TLS
 * **Stay Local:** Keep it on your local private network
 * **Kobo Password:** prevent unauthorized mounting with a Kobo password
 

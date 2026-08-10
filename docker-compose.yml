@@ -1,5 +1,6 @@
 services:
   readeckobo:
+    restart: always
     build: .
     container_name: readeckobo
     user: "1000:1000"

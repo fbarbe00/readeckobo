@@ -389,6 +389,7 @@ func TestHandleKoboGet(t *testing.T) {
 		})
 	}
 }
+
 // koboDownloadTestCase defines the structure for test cases in TestHandleKoboDownload.
 type koboDownloadTestCase struct {
 	name           string
@@ -843,4 +844,217 @@ func TestHandleConvertImage(t *testing.T) {
 	})
 }
 
+func TestHandleStoreAPIInitialization_RewritesInstapaperURL(t *testing.T) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/initialization" {
+			t.Fatalf("unexpected upstream path: %s", r.URL.Path)
+		}
+		if got := r.Host; got == "" {
+			t.Fatalf("expected upstream host to be set")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"url":"https://www.instapaper.com/api/1/oauth/access_token"}`))
+	}))
+	defer upstream.Close()
 
+	u, _ := url.Parse(upstream.URL)
+
+	app := NewApp(
+		WithConfig(&config.Config{
+			Readeck: config.ConfigReadeck{Host: "https://readeck.example.com"},
+			Kobo:    config.ConfigKobo{StoreAPIHost: u.Host},
+		}),
+		WithLogger(testLogger),
+		WithStoreAPIHTTPClient(upstream.Client()),
+	)
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/instapaper-proxy/storeapi/v1/initialization", nil)
+	req.Host = "example.com"
+	rr := httptest.NewRecorder()
+
+	app.HandleStoreAPIInitialization(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	body := rr.Body.String()
+	want := "http://example.com/instapaper-proxy/instapaper/api/1/oauth/access_token"
+	if !strings.Contains(body, want) {
+		t.Fatalf("expected body to contain rewritten URL %q, got %s", want, body)
+	}
+}
+
+func TestHandleStoreAPIProxy(t *testing.T) {
+	var gotHost string
+	var gotPath string
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHost = r.Host
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	u, _ := url.Parse(upstream.URL)
+
+	app := NewApp(
+		WithConfig(&config.Config{
+			Kobo: config.ConfigKobo{StoreAPIHost: u.Host},
+		}),
+		WithLogger(testLogger),
+		WithStoreAPIHTTPClient(upstream.Client()),
+	)
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/instapaper-proxy/storeapi/v1/books", nil)
+	rr := httptest.NewRecorder()
+
+	app.HandleStoreAPIProxy(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	if gotPath != "/v1/books" {
+		t.Fatalf("expected upstream path /v1/books, got %s", gotPath)
+	}
+	if gotHost != u.Host {
+		t.Fatalf("expected upstream host %s, got %s", u.Host, gotHost)
+	}
+}
+
+func TestHandleInstapaperProxyDispatchesArticleRoute(t *testing.T) {
+	application := NewApp(WithLogger(testLogger))
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/instapaper-proxy/instapaper/api/convert-image", nil)
+	rr := httptest.NewRecorder()
+
+	application.HandleInstapaperProxy(rr, req)
+
+	if req.URL.Path != "/api/convert-image" {
+		t.Errorf("dispatched path = %q, want /api/convert-image", req.URL.Path)
+	}
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d from image handler", rr.Code, http.StatusBadRequest)
+	}
+}
+
+func TestHandleInstapaperProxyRejectsUnknownRoute(t *testing.T) {
+	application := NewApp()
+	rr := httptest.NewRecorder()
+	application.HandleInstapaperProxy(rr, httptest.NewRequest(http.MethodGet, "http://example.com/instapaper-proxy/instapaper/unknown", nil))
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", rr.Code, http.StatusNotFound)
+	}
+}
+
+func TestNewReadeckClientUsesDeviceAccount(t *testing.T) {
+	application := NewApp(WithConfig(&config.Config{
+		Readeck: config.ConfigReadeck{Host: "https://default.example.com"},
+		Users: []config.User{
+			{Token: "device-one", ReadeckAccessToken: "account-one"},
+			{Token: "device-two", ReadeckAccessToken: "account-two", ReadeckHost: "https://other.example.com"},
+		},
+	}))
+
+	tests := []struct {
+		deviceToken string
+		wantHost    string
+		wantToken   string
+	}{
+		{deviceToken: "device-one", wantHost: "https://default.example.com", wantToken: "account-one"},
+		{deviceToken: "device-two", wantHost: "https://other.example.com", wantToken: "account-two"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.deviceToken, func(t *testing.T) {
+			user, err := application.getUser(test.deviceToken)
+			if err != nil {
+				t.Fatalf("getUser() error = %v", err)
+			}
+			client, err := application.newReadeckClient(user)
+			if err != nil {
+				t.Fatalf("newReadeckClient() error = %v", err)
+			}
+			if got := client.BaseURL.String(); got != test.wantHost {
+				t.Errorf("BaseURL = %q, want %q", got, test.wantHost)
+			}
+			if client.AccessToken != test.wantToken {
+				t.Errorf("AccessToken = %q, want %q", client.AccessToken, test.wantToken)
+			}
+		})
+	}
+}
+
+func TestHandleFallbackProxy(t *testing.T) {
+	var gotPath, gotQuery, gotHost, gotForwardedHost, gotForwardedProto string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotQuery = r.URL.RawQuery
+		gotHost = r.Host
+		gotForwardedHost = r.Header.Get("X-Forwarded-Host")
+		gotForwardedProto = r.Header.Get("X-Forwarded-Proto")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	application := NewApp(
+		WithConfig(&config.Config{Kobo: config.ConfigKobo{FallbackURL: upstream.URL + "/calibre"}}),
+		WithFallbackHTTPClient(upstream.Client()),
+	)
+	req := httptest.NewRequest(http.MethodGet, "http://readeckobo.example/kobo/device-token/v1/library/sync?Filter=ALL", nil)
+	req.Header.Set("X-Forwarded-Proto", "https")
+	rr := httptest.NewRecorder()
+
+	application.HandleFallbackProxy(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusNoContent)
+	}
+	if gotPath != "/calibre/kobo/device-token/v1/library/sync" {
+		t.Errorf("path = %q, want preserved device path", gotPath)
+	}
+	if gotQuery != "Filter=ALL" {
+		t.Errorf("query = %q, want Filter=ALL", gotQuery)
+	}
+	upstreamURL, _ := url.Parse(upstream.URL)
+	if gotHost != upstreamURL.Host {
+		t.Errorf("host = %q, want %q", gotHost, upstreamURL.Host)
+	}
+	if gotForwardedHost != "readeckobo.example" {
+		t.Errorf("X-Forwarded-Host = %q, want readeckobo.example", gotForwardedHost)
+	}
+	if gotForwardedProto != "https" {
+		t.Errorf("X-Forwarded-Proto = %q, want https", gotForwardedProto)
+	}
+}
+
+func TestHandleFallbackProxyRewritesInitialization(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"instapaper":"https://www.instapaper.com/api/1/bookmarks/list"}`))
+	}))
+	defer upstream.Close()
+
+	application := NewApp(
+		WithConfig(&config.Config{Kobo: config.ConfigKobo{FallbackURL: upstream.URL}}),
+		WithFallbackHTTPClient(upstream.Client()),
+	)
+	req := httptest.NewRequest(http.MethodGet, "http://readeckobo.example/kobo/device-token/v1/initialization", nil)
+	req.Header.Set("X-Forwarded-Proto", "https")
+	rr := httptest.NewRecorder()
+
+	application.HandleFallbackProxy(rr, req)
+
+	want := "https://readeckobo.example/instapaper-proxy/instapaper/api/1/bookmarks/list"
+	if !strings.Contains(rr.Body.String(), want) {
+		t.Errorf("response %q does not contain %q", rr.Body.String(), want)
+	}
+}
+
+func TestHandleFallbackProxyDisabled(t *testing.T) {
+	application := NewApp(WithConfig(&config.Config{}))
+	rr := httptest.NewRecorder()
+	application.HandleFallbackProxy(rr, httptest.NewRequest(http.MethodGet, "http://example.com/unknown", nil))
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", rr.Code, http.StatusNotFound)
+	}
+}

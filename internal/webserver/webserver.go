@@ -20,13 +20,16 @@ func ListenAndServe(port int, application *app.App, logger *logger.Logger) {
 	mux.HandleFunc("/api/kobo/download", application.HandleKoboDownload)
 	mux.HandleFunc("/api/kobo/send", application.HandleKoboSend)
 	mux.HandleFunc("/api/convert-image", application.HandleConvertImage)
-	mux.HandleFunc("/instapaper-proxy/storeapi/v1/initialization", application.HandleDumpAndForward)
 
-	// Catch-all for unimplemented routes
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		logger.Warnf("404 Not Found: URL=%s, Method=%s, Params=%v", r.URL.Path, r.Method, r.URL.Query())
-		http.Error(w, "404 Not Found", http.StatusNotFound)
-	})
+	// Proxy routes
+	mux.HandleFunc("/instapaper-proxy/storeapi/v1/initialization", application.HandleStoreAPIInitialization)
+	mux.HandleFunc("/instapaper-proxy/storeapi", application.HandleStoreAPIProxy)
+	mux.HandleFunc("/instapaper-proxy/storeapi/", application.HandleStoreAPIProxy)
+	mux.HandleFunc("/instapaper-proxy/instapaper", application.HandleInstapaperProxy)
+	mux.HandleFunc("/instapaper-proxy/instapaper/", application.HandleInstapaperProxy)
+
+	// Optionally preserve book syncing by forwarding every other request.
+	mux.HandleFunc("/", application.HandleFallbackProxy)
 
 	// Apply logging middleware
 	loggedMux := LoggingMiddleware(mux)

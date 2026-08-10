@@ -29,15 +29,29 @@ import (
 )
 
 type App struct {
-	Config            *config.Config
-	Logger            *logger.Logger
-	ImageHTTPClient   *http.Client
-	ReadeckHTTPClient *http.Client
+	Config             *config.Config
+	Logger             *logger.Logger
+	ImageHTTPClient    *http.Client
+	ReadeckHTTPClient  *http.Client
+	StoreAPIHTTPClient *http.Client
+	FallbackHTTPClient *http.Client
 }
 
 func WithImageHTTPClient(client *http.Client) Option {
 	return func(a *App) {
 		a.ImageHTTPClient = client
+	}
+}
+
+func WithStoreAPIHTTPClient(client *http.Client) Option {
+	return func(a *App) {
+		a.StoreAPIHTTPClient = client
+	}
+}
+
+func WithFallbackHTTPClient(client *http.Client) Option {
+	return func(a *App) {
+		a.FallbackHTTPClient = client
 	}
 }
 
@@ -219,14 +233,14 @@ func (a *App) HandleKoboGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	readeckToken, err := a.getReadeckToken(req.AccessToken)
+	user, err := a.getUser(req.AccessToken)
 	if err != nil {
 		http.Error(w, "Invalid access token", http.StatusUnauthorized)
 		a.Logger.Errorf("Error authenticating token for /api/kobo/get: %v, URL: %s, Params: %v", err, r.URL.Path, r.URL.Query())
 		return
 	}
 
-	readeckClient, err := a.newReadeckClient(readeckToken)
+	readeckClient, err := a.newReadeckClient(user)
 	if err != nil {
 		http.Error(w, "Failed to initialize Readeck client", http.StatusInternalServerError)
 		a.Logger.Errorf("Error initializing Readeck client for /api/kobo/get: %v, URL: %s, Params: %v", err, r.URL.Path, r.URL.Query())
@@ -352,14 +366,14 @@ func (a *App) HandleKoboDownload(w http.ResponseWriter, r *http.Request) {
 		req.URL = r.FormValue("url")
 	}
 
-	readeckToken, err := a.getReadeckToken(req.AccessToken)
+	user, err := a.getUser(req.AccessToken)
 	if err != nil {
 		http.Error(w, "Invalid access token", http.StatusUnauthorized)
 		a.Logger.Errorf("Error authenticating token for /api/kobo/download: %v, URL: %s, Params: %v", err, r.URL.Path, r.URL.Query())
 		return
 	}
 
-	readeckClient, err := a.newReadeckClient(readeckToken)
+	readeckClient, err := a.newReadeckClient(user)
 	if err != nil {
 		http.Error(w, "Failed to initialize Readeck client", http.StatusInternalServerError)
 		a.Logger.Errorf("Error initializing Readeck client for /api/kobo/download: %v, URL: %s, Params: %v", err, r.URL.Path, r.URL.Query())
@@ -537,14 +551,14 @@ func (a *App) HandleKoboSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	readeckToken, err := a.getReadeckToken(req.AccessToken)
+	user, err := a.getUser(req.AccessToken)
 	if err != nil {
 		http.Error(w, "Invalid access token", http.StatusUnauthorized)
 		a.Logger.Errorf("Error authenticating token for /api/kobo/send: %v, URL: %s, Params: %v", err, r.URL.Path, r.URL.Query())
 		return
 	}
 
-	readeckClient, err := a.newReadeckClient(readeckToken)
+	readeckClient, err := a.newReadeckClient(user)
 	if err != nil {
 		http.Error(w, "Failed to initialize Readeck client", http.StatusInternalServerError)
 		a.Logger.Errorf("Error initializing Readeck client for /api/kobo/send: %v, URL: %s, Params: %v", err, r.URL.Path, r.URL.Query())
@@ -701,41 +715,175 @@ func compareURLs(url1, url2 string) (bool, error) {
 	return u1.Scheme == u2.Scheme && u1.Host == u2.Host && u1.Path == u2.Path, nil
 }
 
-func (a *App) getReadeckToken(deviceToken string) (string, error) {
-	for _, user := range a.Config.Users {
-		if user.Token == deviceToken {
-			return user.ReadeckAccessToken, nil
+func (a *App) getUser(deviceToken string) (*config.User, error) {
+	for i := range a.Config.Users {
+		if a.Config.Users[i].Token == deviceToken {
+			return &a.Config.Users[i], nil
 		}
 	}
-	return "", fmt.Errorf("unauthorized device token")
+	return nil, fmt.Errorf("unauthorized device token")
 }
 
-func (a *App) newReadeckClient(readeckToken string) (*readeck.Client, error) {
-	return readeck.NewClient(a.Config.Readeck.Host, readeckToken, a.Logger, a.ReadeckHTTPClient)
+func (a *App) newReadeckClient(user *config.User) (*readeck.Client, error) {
+	host := user.ReadeckHost
+	if host == "" {
+		host = a.Config.Readeck.Host
+	}
+	return readeck.NewClient(host, user.ReadeckAccessToken, a.Logger, a.ReadeckHTTPClient)
 }
 
-func (a *App) HandleDumpAndForward(w http.ResponseWriter, r *http.Request) {
-	a.Logger.Debugf("Dumping request from %s", r.RemoteAddr)
-	a.Logger.Debugf("Method: %s", r.Method)
-	a.Logger.Debugf("URL: %s", r.URL.String())
-	a.Logger.Debugf("Headers: %v", r.Header)
-
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
-		a.Logger.Debugf("Error reading request body: %v", err)
-		return
+func requestScheme(r *http.Request) string {
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		parts := strings.Split(proto, ",")
+		return strings.TrimSpace(parts[0])
 	}
-	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-
-	a.Logger.Debugf("Body: %s", string(bodyBytes))
-
-	target, err := url.Parse("https://storeapi.kobo.com")
-	if err != nil {
-		a.Logger.Errorf("Error parsing target URL: %v", err)
-		return
+	if r.TLS != nil {
+		return "https"
 	}
-	proxy := httputil.NewSingleHostReverseProxy(target)
+	return "http"
+}
+
+func (a *App) storeAPIHTTPClient() *http.Client {
+	if a.StoreAPIHTTPClient != nil {
+		return a.StoreAPIHTTPClient
+	}
+	return &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+		},
+	}
+}
+
+func (a *App) HandleStoreAPIProxy(w http.ResponseWriter, r *http.Request) {
+	targetHost := a.Config.Kobo.StoreAPIHost
+	if targetHost == "" {
+		targetHost = "storeapi.kobo.com"
+	}
+
+	proxy := &httputil.ReverseProxy{
+		Transport: a.storeAPIHTTPClient().Transport,
+		Director: func(req *http.Request) {
+			req.URL.Scheme = "https"
+			req.URL.Host = targetHost
+			req.URL.Path = strings.TrimPrefix(req.URL.Path, "/instapaper-proxy/storeapi")
+			if req.URL.Path == "" {
+				req.URL.Path = "/"
+			}
+			req.Host = targetHost
+		},
+	}
 	proxy.ServeHTTP(w, r)
 }
 
+func (a *App) HandleStoreAPIInitialization(w http.ResponseWriter, r *http.Request) {
+	targetHost := a.Config.Kobo.StoreAPIHost
+	if targetHost == "" {
+		targetHost = "storeapi.kobo.com"
+	}
+
+	rp := &httputil.ReverseProxy{
+		Transport: a.storeAPIHTTPClient().Transport,
+		Director: func(req *http.Request) {
+			req.URL.Scheme = "https"
+			req.URL.Host = targetHost
+			req.URL.Path = strings.TrimPrefix(req.URL.Path, "/instapaper-proxy/storeapi")
+			if req.URL.Path == "" {
+				req.URL.Path = "/"
+			}
+			req.Host = targetHost
+			req.Header.Set("Accept-Encoding", "")
+		},
+		ModifyResponse: a.rewriteInitializationResponse(r),
+	}
+	rp.ServeHTTP(w, r)
+}
+
+func (a *App) rewriteInitializationResponse(r *http.Request) func(*http.Response) error {
+	return func(resp *http.Response) error {
+		if resp.StatusCode != http.StatusOK || !strings.Contains(resp.Header.Get("Content-Type"), "application/json") {
+			return nil
+		}
+
+		bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+		if err != nil {
+			return err
+		}
+		_ = resp.Body.Close()
+
+		prefix := requestScheme(r) + "://" + r.Host + "/instapaper-proxy/instapaper"
+		body := strings.ReplaceAll(string(bodyBytes), "https://www.instapaper.com", prefix)
+		body = strings.ReplaceAll(body, "http://www.instapaper.com", prefix)
+
+		resp.Body = io.NopCloser(strings.NewReader(body))
+		resp.ContentLength = int64(len(body))
+		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		return nil
+	}
+}
+
+func (a *App) HandleFallbackProxy(w http.ResponseWriter, r *http.Request) {
+	if a.Config.Kobo.FallbackURL == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	target, err := url.Parse(a.Config.Kobo.FallbackURL)
+	if err != nil {
+		http.Error(w, "Invalid fallback URL configuration", http.StatusInternalServerError)
+		return
+	}
+
+	transport := http.DefaultTransport
+	if a.FallbackHTTPClient != nil && a.FallbackHTTPClient.Transport != nil {
+		transport = a.FallbackHTTPClient.Transport
+	}
+
+	proxy := &httputil.ReverseProxy{
+		Transport: transport,
+		Director: func(req *http.Request) {
+			req.URL.Scheme = target.Scheme
+			req.URL.Host = target.Host
+			req.URL.Path = joinURLPath(target.Path, req.URL.Path)
+			req.Host = target.Host
+			req.Header.Set("X-Forwarded-Host", r.Host)
+			req.Header.Set("X-Forwarded-Proto", requestScheme(r))
+			req.Header.Set("X-Scheme", requestScheme(r))
+			if strings.HasSuffix(r.URL.Path, "/v1/initialization") {
+				req.Header.Set("Accept-Encoding", "")
+			}
+		},
+	}
+	if strings.HasSuffix(r.URL.Path, "/v1/initialization") {
+		proxy.ModifyResponse = a.rewriteInitializationResponse(r)
+	}
+	proxy.ServeHTTP(w, r)
+}
+
+func joinURLPath(basePath, requestPath string) string {
+	basePath = strings.TrimRight(basePath, "/")
+	if basePath == "" {
+		return "/" + strings.TrimLeft(requestPath, "/")
+	}
+	return basePath + "/" + strings.TrimLeft(requestPath, "/")
+}
+
+func (a *App) HandleInstapaperProxy(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 128<<20)
+	r.URL.Path = "/" + strings.TrimLeft(strings.TrimPrefix(r.URL.Path, "/instapaper-proxy/instapaper"), "/")
+
+	var handler http.HandlerFunc
+	switch r.URL.Path {
+	case "/api/kobo/get":
+		handler = a.HandleKoboGet
+	case "/api/kobo/download":
+		handler = a.HandleKoboDownload
+	case "/api/kobo/send":
+		handler = a.HandleKoboSend
+	case "/api/convert-image":
+		handler = a.HandleConvertImage
+	default:
+		http.NotFound(w, r)
+		return
+	}
+	handler.ServeHTTP(w, r)
+}
